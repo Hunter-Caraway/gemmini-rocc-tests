@@ -147,4 +147,52 @@ static void nm_ref_sparse(size_t i, size_t k, size_t j, const elem_t * a, size_t
     }
 }
 
+// ---------------------------------------------------------------------------
+// gemmini side of sparse mode
+// changed: added sparse config + index loading wrappers
+//
+// how the sparse ws mode works:
+//  - config_ex with rs1[10] set turns it on (ws only, no transposes)
+//  - nm meta cmd (funct 26) stages index rows, call nm_load_meta before each preload
+//  - preload(wc_tile, c) loads a DIM x DIM squashed weight tile and grabs the staged idx
+//  - compute_preloaded(a_lo, a_hi) streams a dense activation tile that is 2*DIM wide,
+//    a_lo = cols 0..DIM-1 and a_hi = cols DIM..2*DIM-1 (no bias slot in this mode)
+// so one squashed DIM x DIM tile covers 2*DIM rows of the original weights
+
+#include "include/gemmini.h"
+
+#define k_NM_META 26
+
+#define NM_CONFIG_EX_SPARSE_BIT 10
+
+// same as gemmini_extended3_config_ex but with the sparse bit
+#define gemmini_nm_config_ex(sparse, sys_act, sys_shift, sys_acc_scale, C_stride, A_stride) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)acc_scale_t_to_acc_scale_t_bits((acc_scale_t)sys_acc_scale) << 32) | ((uint64_t)(A_stride) << 16) | ((uint64_t)(sparse) << NM_CONFIG_EX_SPARSE_BIT) | ((sys_act) << 3) | ((WEIGHT_STATIONARY) << 2) | CONFIG_EX, ((uint64_t)(C_stride) << 48) | (sys_shift), k_CONFIG)
+
+static inline int nm_idx_bits(int m) {
+  int b = 0;
+  while ((1 << b) < m) b++;
+  return b;
+}
+
+// pack one DIM x DIM tile of indices into meta cmds and send them
+// packing: each idx is log2(m) bits, a row is DIM of them (col 0 lowest),
+// each 64 bit reg takes as many whole rows as fit, rs1 first then rs2
+static void nm_load_meta(const nm_idx_t * idx, size_t stride, int m) {
+  const int ib = nm_idx_bits(m);
+  const int row_bits = DIM * ib;
+  const int rows_per_reg = 64 / row_bits;
+  int r = 0;
+  while (r < DIM) {
+    uint64_t regs[2] = {0, 0};
+    for (int ri = 0; ri < 2; ri++)
+      for (int q = 0; q < rows_per_reg; q++, r++) {
+        if (r >= DIM) continue;
+        for (int c = 0; c < DIM; c++)
+          regs[ri] |= (uint64_t)(idx[r * stride + c] & ((1 << ib) - 1)) << (q * row_bits + c * ib);
+      }
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, regs[0], regs[1], k_NM_META);
+  }
+}
+
 #endif // GEMMINI_NM_H

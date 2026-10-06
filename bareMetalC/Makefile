@@ -58,6 +58,7 @@ tests = \
 	gemmini_counter \
 	template \
 	nm_sparse_sw \
+	nm_sparse_matmul \
 
 tests_baremetal = $(tests:=-baremetal)
 
