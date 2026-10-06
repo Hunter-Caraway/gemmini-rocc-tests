@@ -59,6 +59,8 @@ tests = \
 	template \
 	nm_sparse_sw \
 	nm_sparse_matmul \
+	nm_sparse_debug \
+	nm_sparse_perf \
 
 tests_baremetal = $(tests:=-baremetal)
 

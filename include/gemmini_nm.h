@@ -175,24 +175,45 @@ static inline int nm_idx_bits(int m) {
   return b;
 }
 
-// pack one DIM x DIM tile of indices into meta cmds and send them
+// how many meta cmds one DIM x DIM index tile takes
+static inline int nm_meta_cmds(int m) {
+  const int rows_per_cmd = 2 * (64 / (DIM * nm_idx_bits(m)));
+  return (DIM + rows_per_cmd - 1) / rows_per_cmd;
+}
+
+// pack one DIM x DIM tile of indices into the 64 bit words the meta cmds carry
+// (2 words per cmd). do this once when you prep the weights, not in the hot loop
 // packing: each idx is log2(m) bits, a row is DIM of them (col 0 lowest),
 // each 64 bit reg takes as many whole rows as fit, rs1 first then rs2
-static void nm_load_meta(const nm_idx_t * idx, size_t stride, int m) {
+static void nm_pack_meta(const nm_idx_t * idx, size_t stride, int m, uint64_t * out) {
   const int ib = nm_idx_bits(m);
   const int row_bits = DIM * ib;
   const int rows_per_reg = 64 / row_bits;
+  const int words = 2 * nm_meta_cmds(m);
   int r = 0;
-  while (r < DIM) {
-    uint64_t regs[2] = {0, 0};
-    for (int ri = 0; ri < 2; ri++)
-      for (int q = 0; q < rows_per_reg; q++, r++) {
-        if (r >= DIM) continue;
-        for (int c = 0; c < DIM; c++)
-          regs[ri] |= (uint64_t)(idx[r * stride + c] & ((1 << ib) - 1)) << (q * row_bits + c * ib);
-      }
-    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, regs[0], regs[1], k_NM_META);
+  for (int w = 0; w < words; w++) {
+    uint64_t v = 0;
+    for (int q = 0; q < rows_per_reg; q++, r++) {
+      if (r >= DIM) continue;
+      for (int c = 0; c < DIM; c++)
+        v |= (uint64_t)(idx[r * stride + c] & ((1 << ib) - 1)) << (q * row_bits + c * ib);
+    }
+    out[w] = v;
   }
+}
+
+// send an already packed index tile
+static inline void nm_send_meta(const uint64_t * packed, int m) {
+  const int cmds = nm_meta_cmds(m);
+  for (int i = 0; i < cmds; i++)
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, packed[2 * i], packed[2 * i + 1], k_NM_META);
+}
+
+// pack + send in one go (handy for tests, slow-ish since it packs every time)
+static void nm_load_meta(const nm_idx_t * idx, size_t stride, int m) {
+  uint64_t packed[2 * DIM];
+  nm_pack_meta(idx, stride, m, packed);
+  nm_send_meta(packed, m);
 }
 
 #endif // GEMMINI_NM_H
