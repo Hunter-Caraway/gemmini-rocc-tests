@@ -153,8 +153,11 @@ static void nm_ref_sparse(size_t i, size_t k, size_t j, const elem_t * a, size_t
 //
 // how the sparse ws mode works:
 //  - config_ex with rs1[10] set turns it on (ws only, no transposes)
-//  - nm meta cmd (funct 26) stages index rows, call nm_load_meta before each preload
-//  - preload(wc_tile, c) loads a DIM x DIM squashed weight tile and grabs the staged idx
+//  - nm meta cmds (funct 26) send one DIM x DIM index tile (nm_send_meta). the hw keeps
+//    a small fifo of these (4 tiles), they dont take reservation station slots
+//  - every real preload(wc_tile, c) in sparse mode pops the oldest index tile, so send each
+//    tile's indexes before its preload. preload(GARBAGE_ADDR, c) doesnt pop anything
+//    (thats the weight reuse case with compute_accumulated)
 //  - compute_preloaded(a_lo, a_hi) streams a dense activation tile that is 2*DIM wide,
 //    a_lo = cols 0..DIM-1 and a_hi = cols DIM..2*DIM-1 (no bias slot in this mode)
 // so one squashed DIM x DIM tile covers 2*DIM rows of the original weights

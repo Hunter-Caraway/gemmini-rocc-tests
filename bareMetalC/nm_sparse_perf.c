@@ -2,11 +2,14 @@
 // changed: new test. no cpu reference here (too slow in rtl sim), it checks the sparse
 // outputs against the dense gemmini outputs instead. nm_sparse_matmul covers the cpu check.
 //
-// runs:
-//   dense         plain ws, preload/compute per dense weight tile
-//   sparse        preload(q), meta(q+1), compute(q)  <- the intended order
-//   sparse_nat    meta(q), preload(q), compute(q)    <- simple order, kills the overlap
-//   sparse_nometa indexes sent once up front, results are junk, shows the datapath-only time
+// runs (no reuse = fresh weight preload for every a tile, reuse = preload once per weight
+// tile then compute_accumulated over all the a tiles, which is what tiled_matmul does):
+//   dense           plain ws, no reuse
+//   dense_bias      plain ws with a real bias tile, same b port the sparse a_hi uses
+//   sparse          meta(0), then preload(q), meta(q+1), compute(q), no reuse
+//   sparse_nat      meta(q), preload(q), compute(q), no reuse
+//   dense_reuse     dense with weight reuse
+//   sparse_reuse    sparse with weight reuse
 
 #include <stdint.h>
 #include <stddef.h>
@@ -53,26 +56,47 @@ static acc_t c_sparse[NM_I][NM_J] row_align_acc(1);
 #define FULL_BIT ((uint32_t)1 << (ADDR_LEN - 3))
 #define C_ACC(it, jt) (((it) * JT + (jt)) * DIM)
 
+// cpu_only = run the same issue loop but swap every gemmini instruction for an empty asm
+// that still uses its operands, so the time is just what the core needs to build the
+// command stream (no accelerator, no backpressure)
+static int cpu_only = 0;
+#define SINK(x, y) asm volatile ("" :: "r"((uint64_t)(x)), "r"((uint64_t)(y)))
+#define PRELOAD(b, c) do { if (cpu_only) SINK(b, c); else { gemmini_preload(b, c); } } while (0)
+#define COMPUTE_PRE(a, bd) do { if (cpu_only) SINK(a, bd); else { gemmini_compute_preloaded(a, bd); } } while (0)
+#define COMPUTE_ACC(a, bd) do { if (cpu_only) SINK(a, bd); else { gemmini_compute_accumulated(a, bd); } } while (0)
+static inline void send_meta(const uint64_t * packed) {
+  if (!cpu_only) { nm_send_meta(packed, NM_M); return; }
+  for (int i = 0; i < nm_meta_cmds(NM_M); i++) SINK(packed[2 * i], packed[2 * i + 1]);
+}
+
 static const int ctr_ids[8] = {
-  EXE_ACTIVE_CYCLE, EXE_FLUSH_CYCLE, EXE_PRELOAD_HAZ_CYCLE, EXE_OVERLAP_HAZ_CYCLE,
-  RESERVATION_STATION_FULL_CYCLES, EXE_CONTROL_Q_BLOCK_CYCLE, SCRATCHPAD_B_WAIT_CYCLE, MAIN_EX_CYCLES
+  EXE_ACTIVE_CYCLE, RESERVATION_STATION_FULL_CYCLES, EXE_CONTROL_Q_BLOCK_CYCLE, EXE_OVERLAP_HAZ_CYCLE,
+  SCRATCHPAD_A_WAIT_CYCLE, SCRATCHPAD_B_WAIT_CYCLE, SCRATCHPAD_D_WAIT_CYCLE, MAIN_EX_CYCLES
 };
 static const char * ctr_names[8] = {
-  "ex_active", "ex_flush", "preload_haz", "overlap_haz",
-  "rs_full", "ctrl_q_block", "spad_b_wait", "main_ex"
+  "ex_active", "rs_full", "ctrl_q_block", "overlap_haz",
+  "spad_a_wait", "spad_b_wait", "spad_d_wait", "main_ex"
 };
+static uint32_t ctr_vals[8];
 
 static void ctr_start() {
-  for (int i = 0; i < 8; i++) counter_configure(i, ctr_ids[i]);
   counter_reset();
   for (int i = 0; i < 8; i++) counter_configure(i, ctr_ids[i]);
+}
+
+// freeze the counters right when the work is done, some of them keep ticking on
+// stale control signals while the array sits idle
+static void ctr_stop() {
+  counter_snapshot_take();
+  for (int i = 0; i < 8; i++) ctr_vals[i] = counter_read(i);
+  counter_snapshot_reset();
 }
 
 static void report(const char * name, uint64_t start, uint64_t issued, uint64_t end, int pairs) {
   printf("%-14s total %6llu  cpu_issue_done %6llu  pairs %3d  cyc/pair %4llu |",
     name, (unsigned long long)(end - start), (unsigned long long)(issued - start), pairs,
     (unsigned long long)((end - start) / pairs));
-  for (int i = 0; i < 8; i++) printf(" %s=%d", ctr_names[i], counter_read(i));
+  for (int i = 0; i < 8; i++) printf(" %s=%u", ctr_names[i], ctr_vals[i]);
   printf("\n");
 }
 
@@ -94,29 +118,86 @@ static int same(void) {
   return 1;
 }
 
-// mode 0 = intended order, 1 = natural order, 2 = no meta in the loop
-static void run_sparse(int mode, const char * name) {
-  const int ntiles = IT * JT * KCT;
-  gemmini_nm_config_ex(1, NO_ACTIVATION, 0, ACC_SCALE_IDENTITY, 1, 1);
-  if (mode == 2) nm_send_meta(meta[0][0], NM_M);
+// bias = 1 streams a real bias tile through the b port (results not checked)
+static void run_dense(int bias, const char * name) {
+  gemmini_config_ex(WEIGHT_STATIONARY, NO_ACTIVATION, 0);
   gemmini_fence();
   ctr_start();
   uint64_t start = read_cycles();
-  if (mode == 0) nm_send_meta(meta[0][0], NM_M);
-  for (int q = 0; q < ntiles; q++) {
-    const int it = q / (JT * KCT), jt = (q / KCT) % JT, t = q % KCT;
-    uint32_t c = ACC_BIT | (t > 0 ? ACCUM_BIT : 0) | C_ACC(it, jt);
-    if (mode == 1) nm_send_meta(meta[t][jt], NM_M);
-    gemmini_preload(WC_SP(t, jt), c);
-    if (mode == 0 && q + 1 < ntiles) {
-      const int jn = ((q + 1) / KCT) % JT, tn = (q + 1) % KCT;
-      nm_send_meta(meta[tn][jn], NM_M);
+  for (int it = 0; it < IT; it++)
+    for (int jt = 0; jt < JT; jt++)
+      for (int kt = 0; kt < KT; kt++) {
+        uint32_t c = ACC_BIT | (kt > 0 ? ACCUM_BIT : 0) | C_ACC(it, jt);
+        PRELOAD(W_SP(kt, jt), c);
+        // the bias just reuses an a tile from the other bank, values dont matter here
+        COMPUTE_PRE(A_SP(it, kt), bias ? A_SP(it, kt ^ 1) : GARBAGE_ADDR);
+      }
+  uint64_t issued = read_cycles();
+  gemmini_fence();
+  uint64_t end = read_cycles();
+  ctr_stop();
+  report(name, start, issued, end, IT * JT * KT);
+}
+
+// weight reuse: one real preload per weight tile, then preload(garbage, c) +
+// compute_accumulated keeps the same weights for the rest of the a tiles
+static void run_reuse(int sparse, const char * name) {
+  const int ktiles = sparse ? KCT : KT;
+  const int blocks = JT * ktiles;
+  // gemmini macros are multi statement, keep the braces
+  if (sparse) { gemmini_nm_config_ex(1, NO_ACTIVATION, 0, ACC_SCALE_IDENTITY, 1, 1); }
+  else { gemmini_config_ex(WEIGHT_STATIONARY, NO_ACTIVATION, 0); }
+  gemmini_fence();
+  ctr_start();
+  uint64_t start = read_cycles();
+  if (sparse) send_meta(meta[0][0]);
+  for (int b = 0; b < blocks; b++) {
+    const int jt = b / ktiles, kt = b % ktiles;
+    for (int it = 0; it < IT; it++) {
+      uint32_t c = ACC_BIT | (kt > 0 ? ACCUM_BIT : 0) | C_ACC(it, jt);
+      if (it == 0) { PRELOAD(sparse ? WC_SP(kt, jt) : W_SP(kt, jt), c); }
+      else { PRELOAD(GARBAGE_ADDR, c); }
+      // next block's indexes go after the last preload of this block, before its compute
+      if (sparse && it == IT - 1 && b + 1 < blocks)
+        send_meta(meta[(b + 1) % ktiles][(b + 1) / ktiles]);
+      const uint32_t a_lo = sparse ? A_SP(it, 2 * kt) : A_SP(it, kt);
+      const uint32_t bd = sparse ? A_SP(it, 2 * kt + 1) : GARBAGE_ADDR;
+      if (it == 0) { COMPUTE_PRE(a_lo, bd); }
+      else { COMPUTE_ACC(a_lo, bd); }
     }
-    gemmini_compute_preloaded(A_SP(it, 2 * t), A_SP(it, 2 * t + 1));
   }
   uint64_t issued = read_cycles();
   gemmini_fence();
   uint64_t end = read_cycles();
+  ctr_stop();
+  report(name, start, issued, end, blocks * IT);
+  gemmini_config_ex(WEIGHT_STATIONARY, NO_ACTIVATION, 0);
+  gemmini_fence();
+}
+
+// mode 0 = meta for the next tile sent between preload and compute, 1 = natural order
+static void run_sparse(int mode, const char * name) {
+  const int ntiles = IT * JT * KCT;
+  gemmini_nm_config_ex(1, NO_ACTIVATION, 0, ACC_SCALE_IDENTITY, 1, 1);
+  gemmini_fence();
+  ctr_start();
+  uint64_t start = read_cycles();
+  if (mode == 0) send_meta(meta[0][0]);
+  for (int q = 0; q < ntiles; q++) {
+    const int it = q / (JT * KCT), jt = (q / KCT) % JT, t = q % KCT;
+    uint32_t c = ACC_BIT | (t > 0 ? ACCUM_BIT : 0) | C_ACC(it, jt);
+    if (mode == 1) send_meta(meta[t][jt]);
+    PRELOAD(WC_SP(t, jt), c);
+    if (mode == 0 && q + 1 < ntiles) {
+      const int jn = ((q + 1) / KCT) % JT, tn = (q + 1) % KCT;
+      send_meta(meta[tn][jn]);
+    }
+    COMPUTE_PRE(A_SP(it, 2 * t), A_SP(it, 2 * t + 1));
+  }
+  uint64_t issued = read_cycles();
+  gemmini_fence();
+  uint64_t end = read_cycles();
+  ctr_stop();
   report(name, start, issued, end, ntiles);
   gemmini_config_ex(WEIGHT_STATIONARY, NO_ACTIVATION, 0);
   gemmini_fence();
@@ -158,24 +239,9 @@ int main() {
       gemmini_mvin(&wc[t * DIM][jt * DIM], WC_SP(t, jt));
   gemmini_fence();
 
-  // dense
-  gemmini_config_ex(WEIGHT_STATIONARY, NO_ACTIVATION, 0);
-  gemmini_fence();
-  ctr_start();
-  uint64_t start = read_cycles();
-  for (int it = 0; it < IT; it++)
-    for (int jt = 0; jt < JT; jt++)
-      for (int kt = 0; kt < KT; kt++) {
-        uint32_t c = ACC_BIT | (kt > 0 ? ACCUM_BIT : 0) | C_ACC(it, jt);
-        gemmini_preload(W_SP(kt, jt), c);
-        gemmini_compute_preloaded(A_SP(it, kt), GARBAGE_ADDR);
-      }
-  uint64_t issued = read_cycles();
-  gemmini_fence();
-  uint64_t end = read_cycles();
-  report("dense", start, issued, end, IT * JT * KT);
+  run_dense(0, "dense");
   store_c(c_dense);
-
+  run_dense(1, "dense_bias");
   int fails = 0;
   run_sparse(0, "sparse");
   store_c(c_sparse);
@@ -185,8 +251,22 @@ int main() {
   store_c(c_sparse);
   if (!same()) { printf("sparse_nat result wrong\n"); fails++; }
 
-  run_sparse(2, "sparse_nometa");
-  printf("(sparse_nometa results are junk on purpose)\n");
+
+  run_reuse(0, "dense_reuse");
+  store_c(c_dense);
+  run_reuse(1, "sparse_reuse");
+  store_c(c_sparse);
+  if (!same()) { printf("sparse_reuse result wrong\n"); fails++; }
+
+  // same loops again with no accelerator, just the core building the command stream
+  printf("cpu only (no gemmini instructions issued):\n");
+  cpu_only = 1;
+  run_dense(0, "cpu_dense");
+  run_sparse(0, "cpu_sparse");
+  run_sparse(1, "cpu_sparse_nat");
+  run_reuse(0, "cpu_dense_reuse");
+  run_reuse(1, "cpu_sparse_reuse");
+  cpu_only = 0;
 
   if (fails) {
     printf("nm_sparse_perf FAILED\n");
