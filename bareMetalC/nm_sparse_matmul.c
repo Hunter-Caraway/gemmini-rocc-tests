@@ -1,6 +1,8 @@
 // n:m sparse matmul on gemmini vs dense matmul on the same pruned weights
 // changed: new test. checks both against the cpu reference and prints cycles for each
-// c (i x j) = a (i x k) * w (k x j), w pruned n:m down each column
+// c (i x j) = a (i x k) * w (k x j), w pruned n:m down each column, full-range int8 data
+// outputs and accumulators are poisoned before every run, so a run that writes nothing fails.
+// the sparse run starts after a half-sent index tile and gemmini_nm_reset(), so a broken reset fails.
 // sizes are small by default so rtl sim doesnt take forever, bump with -DNM_I=.. etc
 
 #include <stdint.h>
@@ -30,14 +32,17 @@
 #define KC (NM_K / NM_M * NM_N)   // squashed weight rows
 #define KCT (KC / DIM)            // squashed weight tiles
 
-#if (NM_M != 2 * NM_N)
-#error "sparse mode needs m == 2*n"
-#endif
 #if (NM_K % (2 * DIM)) != 0
 #error "k has to be a multiple of 2*DIM"
 #endif
 #if (NM_I / DIM) * (NM_K / DIM / 2) * DIM > BANK_ROWS
 #error "a doesnt fit in its two banks"
+#endif
+#if KT * JT * DIM > BANK_ROWS
+#error "w doesnt fit in its bank"
+#endif
+#if IT * JT * DIM > ACC_ROWS
+#error "c doesnt fit in the accumulator"
 #endif
 
 static elem_t a[NM_I][NM_K] row_align(1);
@@ -48,9 +53,10 @@ static uint64_t meta[KCT][JT][2 * DIM]; // packed indexes per weight tile
 static acc_t gold[NM_I][NM_J];
 static acc_t c_dense[NM_I][NM_J] row_align_acc(1);
 static acc_t c_sparse[NM_I][NM_J] row_align_acc(1);
+static acc_t poison[DIM][DIM] row_align_acc(1);
+#define POISON ((acc_t)0x5EADBEEF)
 
-// spad layout: even a tiles in bank 0, odd a tiles in bank 1, weights in bank 2.
-// keeps a_lo / a_hi / weights from fighting over one bank (each bank reads one row a cycle)
+// even a tiles in bank 0, odd in bank 1, weights in bank 2, so a_lo / a_hi / weights never share a bank
 #define A_SP(it, kt) (((kt) % 2) * BANK_ROWS + ((it) * (KT / 2) + (kt) / 2) * DIM)
 #define W_SP(kt, jt) (2 * BANK_ROWS + ((kt) * JT + (jt)) * DIM)
 #define ACC_BIT ((uint32_t)1 << (ADDR_LEN - 1))
@@ -70,6 +76,18 @@ static void store_c(acc_t c[NM_I][NM_J]) {
   for (int it = 0; it < IT; it++)
     for (int jt = 0; jt < JT; jt++)
       gemmini_mvout(&c[it * DIM][jt * DIM], ACC_BIT | FULL_BIT | C_ACC(it, jt));
+}
+
+// fill the output and every accumulator tile the runs use with POISON
+static void poison_c(acc_t c[NM_I][NM_J]) {
+  for (int y = 0; y < NM_I; y++)
+    for (int x = 0; x < NM_J; x++)
+      c[y][x] = POISON;
+  gemmini_config_ld(DIM * sizeof(acc_t));
+  for (int it = 0; it < IT; it++)
+    for (int jt = 0; jt < JT; jt++)
+      gemmini_mvin(poison, ACC_BIT | C_ACC(it, jt));
+  gemmini_fence();
 }
 
 static int check(const char * name, acc_t c[NM_I][NM_J]) {
@@ -95,18 +113,21 @@ int main() {
 
   for (int y = 0; y < NM_I; y++)
     for (int z = 0; z < NM_K; z++)
-      a[y][z] = (rand() % 16) - 8;
+      a[y][z] = (rand() % 256) - 128;
   for (int z = 0; z < NM_K; z++)
     for (int x = 0; x < NM_J; x++)
-      w[z][x] = (rand() % 16) - 8;
+      w[z][x] = (rand() % 256) - 128;
 
   nm_prune(NM_K, NM_J, &w[0][0], NM_J, NM_N, NM_M);
   nm_compress(NM_K, NM_J, &w[0][0], NM_J, &wc[0][0], &idx[0][0], NM_J, NM_N, NM_M);
   nm_ref_dense(NM_I, NM_K, NM_J, &a[0][0], NM_K, &w[0][0], NM_J, &gold[0][0], NM_J);
+  for (int y = 0; y < DIM; y++)
+    for (int x = 0; x < DIM; x++)
+      poison[y][x] = POISON;
   // index packing is weight prep, same as compressing, so it happens outside the timed part
   for (int t = 0; t < KCT; t++)
     for (int jt = 0; jt < JT; jt++)
-      nm_pack_meta(&idx[t * DIM][jt * DIM], NM_J, NM_M, meta[t][jt]);
+      nm_pack_meta(&idx[t * DIM][jt * DIM], NM_J, DIM, DIM, NM_M, meta[t][jt]);
 
   // ---- dense run, plain ws on the pruned (zero filled) weights ----
   load_a();
@@ -115,7 +136,7 @@ int main() {
     for (int jt = 0; jt < JT; jt++)
       gemmini_mvin(&w[kt * DIM][jt * DIM], W_SP(kt, jt));
   gemmini_config_ex(WEIGHT_STATIONARY, NO_ACTIVATION, 0);
-  gemmini_fence();
+  poison_c(c_dense);
 
   uint64_t d_start = read_cycles();
   for (int it = 0; it < IT; it++)
@@ -137,11 +158,13 @@ int main() {
     for (int jt = 0; jt < JT; jt++)
       gemmini_mvin(&wc[t * DIM][jt * DIM], W_SP(t, jt));
   gemmini_nm_config_ex(1, NO_ACTIVATION, 0, ACC_SCALE_IDENTITY, 1, 1);
-  gemmini_fence();
+  // leave half an index tile behind, then reset: the run below only passes if the reset dropped it
+  for (int i = 0; i < (nm_meta_cmds(NM_M) + 1) / 2; i++)
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ~(uint64_t)0, ~(uint64_t)0, k_NM_META);
+  gemmini_nm_reset();
+  poison_c(c_sparse);
 
-  // order is meta(0), then for each tile: preload(q), meta(q+1), compute(q).
-  // a preload eats the indexes staged before it, so sending the next tile's indexes
-  // before this compute lets the hardware overlap compute(q) with preload(q+1) like dense does
+  // meta(0), then for each tile preload(q), meta(q+1), compute(q): at most 2 tiles queued
   const int ntiles = IT * JT * KCT;
   uint64_t s_start = read_cycles();
   nm_send_meta(meta[0][0], NM_M);

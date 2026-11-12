@@ -1,6 +1,6 @@
 // perf breakdown for the n:m sparse mode vs dense ws on the same pruned weights
-// changed: new test. no cpu reference here (too slow in rtl sim), it checks the sparse
-// outputs against the dense gemmini outputs instead. nm_sparse_matmul covers the cpu check.
+// changed: new test. full-range int8 data; outputs and accumulators are poisoned before every
+// checked run, and every run except dense_bias is checked against the cpu reference.
 //
 // runs (no reuse = fresh weight preload for every a tile, reuse = preload once per weight
 // tile then compute_accumulated over all the a tiles, which is what tiled_matmul does):
@@ -39,13 +39,25 @@
 #define KC (NM_K / NM_M * NM_N)
 #define KCT (KC / DIM)
 
+#if (NM_K % (2 * DIM)) != 0
+#error "k has to be a multiple of 2*DIM"
+#endif
+#if IT * (KT / 2) * DIM > BANK_ROWS || KT * JT * DIM > BANK_ROWS || KCT * JT * DIM > BANK_ROWS
+#error "a, w or wc doesnt fit in its bank(s)"
+#endif
+#if IT * JT * DIM > ACC_ROWS
+#error "c doesnt fit in the accumulator"
+#endif
+
 static elem_t a[NM_I][NM_K] row_align(1);
 static elem_t w[NM_K][NM_J] row_align(1);
 static elem_t wc[KC][NM_J] row_align(1);
 static nm_idx_t idx[KC][NM_J];
 static uint64_t meta[KCT][JT][2 * DIM];
-static acc_t c_dense[NM_I][NM_J] row_align_acc(1);
-static acc_t c_sparse[NM_I][NM_J] row_align_acc(1);
+static acc_t c[NM_I][NM_J] row_align_acc(1);
+static acc_t gold[NM_I][NM_J];
+static acc_t poison[DIM][DIM] row_align_acc(1);
+#define POISON ((acc_t)0x5EADBEEF)
 
 // a: even k tiles bank 0, odd bank 1. dense weights bank 2, squashed weights bank 3
 #define A_SP(it, kt) (((kt) % 2) * BANK_ROWS + ((it) * (KT / 2) + (kt) / 2) * DIM)
@@ -56,9 +68,7 @@ static acc_t c_sparse[NM_I][NM_J] row_align_acc(1);
 #define FULL_BIT ((uint32_t)1 << (ADDR_LEN - 3))
 #define C_ACC(it, jt) (((it) * JT + (jt)) * DIM)
 
-// cpu_only = run the same issue loop but swap every gemmini instruction for an empty asm
-// that still uses its operands, so the time is just what the core needs to build the
-// command stream (no accelerator, no backpressure)
+// cpu_only: same issue loop with every gemmini instruction swapped for an empty asm (core cost only)
 static int cpu_only = 0;
 #define SINK(x, y) asm volatile ("" :: "r"((uint64_t)(x)), "r"((uint64_t)(y)))
 #define PRELOAD(b, c) do { if (cpu_only) SINK(b, c); else { gemmini_preload(b, c); } } while (0)
@@ -84,8 +94,7 @@ static void ctr_start() {
   for (int i = 0; i < 8; i++) counter_configure(i, ctr_ids[i]);
 }
 
-// freeze the counters right when the work is done, some of them keep ticking on
-// stale control signals while the array sits idle
+// freeze the counters when the work is done (some keep ticking on stale signals while idle)
 static void ctr_stop() {
   counter_snapshot_take();
   for (int i = 0; i < 8; i++) ctr_vals[i] = counter_read(i);
@@ -100,22 +109,32 @@ static void report(const char * name, uint64_t start, uint64_t issued, uint64_t 
   printf("\n");
 }
 
-static void store_c(acc_t c[NM_I][NM_J]) {
+// fill c and every accumulator tile the runs use with POISON
+static void poison_c(void) {
+  for (int y = 0; y < NM_I; y++)
+    for (int x = 0; x < NM_J; x++)
+      c[y][x] = POISON;
+  gemmini_config_ld(DIM * sizeof(acc_t));
+  for (int it = 0; it < IT; it++)
+    for (int jt = 0; jt < JT; jt++)
+      gemmini_mvin(poison, ACC_BIT | C_ACC(it, jt));
+  gemmini_fence();
+}
+
+// store the accumulator to c and compare with the cpu reference, returns 1 on a mismatch
+static int check(const char * name) {
   gemmini_config_st(NM_J * sizeof(acc_t));
   for (int it = 0; it < IT; it++)
     for (int jt = 0; jt < JT; jt++)
       gemmini_mvout(&c[it * DIM][jt * DIM], ACC_BIT | FULL_BIT | C_ACC(it, jt));
   gemmini_fence();
-}
-
-static int same(void) {
   for (int y = 0; y < NM_I; y++)
     for (int x = 0; x < NM_J; x++)
-      if (c_dense[y][x] != c_sparse[y][x]) {
-        printf("  mismatch at (%d,%d): dense %d sparse %d\n", y, x, c_dense[y][x], c_sparse[y][x]);
-        return 0;
+      if (c[y][x] != gold[y][x]) {
+        printf("%s result wrong at (%d,%d): got %d want %d\n", name, y, x, c[y][x], gold[y][x]);
+        return 1;
       }
-  return 1;
+  return 0;
 }
 
 // bias = 1 streams a real bias tile through the b port (results not checked)
@@ -139,8 +158,7 @@ static void run_dense(int bias, const char * name) {
   report(name, start, issued, end, IT * JT * KT);
 }
 
-// weight reuse: one real preload per weight tile, then preload(garbage, c) +
-// compute_accumulated keeps the same weights for the rest of the a tiles
+// weight reuse: one real preload per weight tile, then preload(garbage, c) + compute_accumulated
 static void run_reuse(int sparse, const char * name) {
   const int ktiles = sparse ? KCT : KT;
   const int blocks = JT * ktiles;
@@ -215,15 +233,19 @@ int main() {
 
   for (int y = 0; y < NM_I; y++)
     for (int z = 0; z < NM_K; z++)
-      a[y][z] = (rand() % 16) - 8;
+      a[y][z] = (rand() % 256) - 128;
   for (int z = 0; z < NM_K; z++)
     for (int x = 0; x < NM_J; x++)
-      w[z][x] = (rand() % 16) - 8;
+      w[z][x] = (rand() % 256) - 128;
   nm_prune(NM_K, NM_J, &w[0][0], NM_J, NM_N, NM_M);
   nm_compress(NM_K, NM_J, &w[0][0], NM_J, &wc[0][0], &idx[0][0], NM_J, NM_N, NM_M);
+  nm_ref_dense(NM_I, NM_K, NM_J, &a[0][0], NM_K, &w[0][0], NM_J, &gold[0][0], NM_J);
+  for (int y = 0; y < DIM; y++)
+    for (int x = 0; x < DIM; x++)
+      poison[y][x] = POISON;
   for (int t = 0; t < KCT; t++)
     for (int jt = 0; jt < JT; jt++)
-      nm_pack_meta(&idx[t * DIM][jt * DIM], NM_J, NM_M, meta[t][jt]);
+      nm_pack_meta(&idx[t * DIM][jt * DIM], NM_J, DIM, DIM, NM_M, meta[t][jt]);
 
   // everything lives in the scratchpad before any timing starts
   gemmini_config_ld(NM_K * sizeof(elem_t));
@@ -239,24 +261,13 @@ int main() {
       gemmini_mvin(&wc[t * DIM][jt * DIM], WC_SP(t, jt));
   gemmini_fence();
 
-  run_dense(0, "dense");
-  store_c(c_dense);
-  run_dense(1, "dense_bias");
   int fails = 0;
-  run_sparse(0, "sparse");
-  store_c(c_sparse);
-  if (!same()) { printf("sparse result wrong\n"); fails++; }
-
-  run_sparse(1, "sparse_nat");
-  store_c(c_sparse);
-  if (!same()) { printf("sparse_nat result wrong\n"); fails++; }
-
-
-  run_reuse(0, "dense_reuse");
-  store_c(c_dense);
-  run_reuse(1, "sparse_reuse");
-  store_c(c_sparse);
-  if (!same()) { printf("sparse_reuse result wrong\n"); fails++; }
+  poison_c(); run_dense(0, "dense"); fails += check("dense");
+  run_dense(1, "dense_bias");
+  poison_c(); run_sparse(0, "sparse"); fails += check("sparse");
+  poison_c(); run_sparse(1, "sparse_nat"); fails += check("sparse_nat");
+  poison_c(); run_reuse(0, "dense_reuse"); fails += check("dense_reuse");
+  poison_c(); run_reuse(1, "sparse_reuse"); fails += check("sparse_reuse");
 
   // same loops again with no accelerator, just the core building the command stream
   printf("cpu only (no gemmini instructions issued):\n");

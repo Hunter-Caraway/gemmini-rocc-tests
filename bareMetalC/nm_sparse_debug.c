@@ -1,6 +1,7 @@
 // tiny single tile n:m test for poking at the rtl
 // changed: new test. runs one squashed weight tile and scores the output against a few
-// "what if it's broken this way" references, so one sim run says which way it's broken
+// "what if it's broken this way" references, so one sim run says which way it's broken.
+// full-range int8 data; the output and its accumulator tile are poisoned first
 
 #include <stdint.h>
 #include <stddef.h>
@@ -23,6 +24,8 @@ static elem_t wc[DIM][DIM] row_align(1);
 static nm_idx_t idx[DIM][DIM];
 static acc_t out[DIM][DIM] row_align_acc(1);
 static acc_t ref[DIM][DIM];
+static acc_t poison[DIM][DIM] row_align_acc(1);
+#define POISON ((acc_t)0x5EADBEEF)
 
 #define ACC_BIT ((uint32_t)1 << (ADDR_LEN - 1))
 #define FULL_BIT ((uint32_t)1 << (ADDR_LEN - 3))
@@ -66,10 +69,10 @@ int main() {
 
   for (int i = 0; i < DIM; i++)
     for (int k = 0; k < K2; k++)
-      a[i][k] = (rand() % 16) - 8;
+      a[i][k] = (rand() % 256) - 128;
   for (int k = 0; k < K2; k++)
     for (int j = 0; j < DIM; j++)
-      w[k][j] = (rand() % 16) - 8;
+      w[k][j] = (rand() % 256) - 128;
   nm_prune(K2, DIM, &w[0][0], DIM, NM_N, NM_M);
   nm_compress(K2, DIM, &w[0][0], DIM, &wc[0][0], &idx[0][0], DIM, NM_N, NM_M);
   for (int i = 0; i < DIM; i++)
@@ -84,9 +87,15 @@ int main() {
   gemmini_mvin(a_lo, lo_sp);
   gemmini_mvin(a_hi, hi_sp);
   gemmini_mvin(wc, w_sp);
+  for (int i = 0; i < DIM; i++)
+    for (int j = 0; j < DIM; j++)
+      out[i][j] = poison[i][j] = POISON;
+  gemmini_config_ld(DIM * sizeof(acc_t));
+  gemmini_mvin(poison, ACC_BIT);
+  gemmini_fence();
 
   gemmini_nm_config_ex(1, NO_ACTIVATION, 0, ACC_SCALE_IDENTITY, 1, 1);
-  nm_load_meta(&idx[0][0], DIM, NM_M);
+  nm_load_meta(&idx[0][0], DIM, DIM, DIM, NM_M);
   gemmini_preload(w_sp, ACC_BIT);
   gemmini_compute_preloaded(lo_sp, hi_sp);
   gemmini_fence();

@@ -61,6 +61,8 @@ tests = \
 	nm_sparse_matmul \
 	nm_sparse_debug \
 	nm_sparse_perf \
+	nm_sparse_protocol \
+	nm_sparse_spad \
 
 tests_baremetal = $(tests:=-baremetal)
 
@@ -117,6 +119,13 @@ CFLAGS_BAREMETAL := \
 	-static \
 	-T $(BENCH_COMMON)/test.ld \
 	-DBAREMETAL=1 \
+
+# changed: n:m pattern for the nm_sparse_* tests (gemmini_nm.h #errors if it disagrees with gemmini_params.h)
+NM_N ?= 2
+NM_M ?= 4
+nm_sparse_%: CFLAGS += -DNM_N=$(NM_N) -DNM_M=$(NM_M)
+nm_sparse_%: CFLAGS_PK += -DNM_N=$(NM_N) -DNM_M=$(NM_M)
+nm_sparse_%: CFLAGS_BAREMETAL += -DNM_N=$(NM_N) -DNM_M=$(NM_M)
 
 all: $(tests_baremetal) $(tests_linux) $(tests_pk)
 
