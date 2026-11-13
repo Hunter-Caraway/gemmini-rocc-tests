@@ -63,6 +63,7 @@ tests = \
 	nm_sparse_perf \
 	nm_sparse_protocol \
 	nm_sparse_spad \
+	nm_sparse_loop \
 
 tests_baremetal = $(tests:=-baremetal)
 
@@ -127,6 +128,14 @@ nm_sparse_%: CFLAGS += -DNM_N=$(NM_N) -DNM_M=$(NM_M)
 nm_sparse_%: CFLAGS_PK += -DNM_N=$(NM_N) -DNM_M=$(NM_M)
 nm_sparse_%: CFLAGS_BAREMETAL += -DNM_N=$(NM_N) -DNM_M=$(NM_M)
 
+# changed: sparse-loop-fix, one program per illegal use of nm_sparse_loop.c (-DNEG=<n>); built by `make nm-loop-neg`
+# only, kept out of `tests` because a NEG program passes by aborting
+nm_loop_negs = 10 11 20 30 40 50 51 52 60 61 70 71 72 73 74 80 90 91 100 120 121 122 130 131 132 133
+# changed: sparse-loop-fix, N11 / N14: dense Spike lib only (libgemmini NM_DENSE_BUILD=1). The dense RTL has no funct
+# 27 / 28 hardware and no assert, and on an n:m build both commands are legal: an RTL NEG runner must skip these
+nm_loop_negs_dense_spike_only = 110 140
+tests_nm_loop_neg = $(patsubst %,nm_sparse_loop_neg%-baremetal,$(nm_loop_negs) $(nm_loop_negs_dense_spike_only))
+
 all: $(tests_baremetal) $(tests_linux) $(tests_pk)
 
 vpath %.c $(src_dir)
@@ -134,6 +143,13 @@ vpath %.c $(src_dir)
 %-baremetal: %.c $(GEMMINI_HEADERS)
 	$(CC_BAREMETAL) $(CFLAGS_BAREMETAL) $< $(LFLAGS) -o $@ \
 		$(wildcard $(BENCH_COMMON)/*.c) $(wildcard $(BENCH_COMMON)/*.S) $(LIBS)
+
+# changed: sparse-loop-fix, the NEG programs of nm_sparse_loop.c
+nm_sparse_loop_neg%-baremetal: nm_sparse_loop.c $(GEMMINI_HEADERS)
+	$(CC_BAREMETAL) $(CFLAGS_BAREMETAL) -DNEG=$* $< $(LFLAGS) -o $@ \
+		$(wildcard $(BENCH_COMMON)/*.c) $(wildcard $(BENCH_COMMON)/*.S) $(LIBS)
+
+nm-loop-neg: $(tests_nm_loop_neg)
 
 %-linux: %.c $(GEMMINI_HEADERS)
 	$(CC_LINUX) $(CFLAGS) $< $(LFLAGS) -o $@
@@ -146,5 +162,5 @@ run-baremetal: $(runs_baremetal)
 %-baremetal.run: %-baremetal
 	$(RUNNER)$(abs_top_srcdir)/build/bareMetalC/$^
 
-junk += $(tests_baremetal) $(tests_linux) $(tests_pk)
+junk += $(tests_baremetal) $(tests_linux) $(tests_pk) $(tests_nm_loop_neg) # changed: sparse-loop-fix, NEG programs
 

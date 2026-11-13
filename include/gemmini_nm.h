@@ -200,6 +200,8 @@ static void nm_ref_sparse(size_t i, size_t k, size_t j, const elem_t * a, size_t
 //    output still in flight). never put a load between a preload and its compute (the rtl can deadlock; spike
 //    won't notice). issue it before the preload or after the compute, e.g. right after the compute of the
 //    previous batch's last tile, so the hardware can fetch the rows before the preloads need them
+//  - changed: sparse-loop-fix. LOOP_WS is legal in sparse mode when (and only when) its rs1[3] is set and a
+//    LOOP_WS_CONFIG_NM (funct 28) came first: gemmini_loop_ws_nm(), see the end of this file. LOOP_CONV_WS stays illegal
 // so one squashed DIM x DIM tile covers 2*DIM rows of the original weights
 
 #include "include/gemmini.h"
@@ -549,6 +551,179 @@ static void tiled_matmul_nm(size_t M, size_t N, size_t K, const elem_t * A, size
 static void tiled_matmul_nm_spad(size_t M, size_t N, size_t K, const elem_t * A, size_t lda,
     const elem_t * Bc, size_t ldb, const uint8_t * meta_sp, acc_t * C, size_t ldc, size_t TI, size_t TJ) {
   nm_stream_impl(2, M, N, K, A, lda, Bc, ldb, NULL, meta_sp, C, ldc, TI, TJ);
+}
+
+// ---------------------------------------------------------------------------
+// changed: sparse-loop-fix. n:m sparse mode inside the LOOP_WS hardware loop
+// spec: gemmini-sparsity experiments/streaming/worklogs/fix-b-spec.md section 2.5 (the rtl and spike implement the same)
+//  - funct 27 LOAD_IDX: an mvin of 1..16 index rows with a fixed config (16 byte dram rows, identity scale), so the
+//    index rows need no config_ld and leave the A, B and bias (D) load strides alone. legal outside loops too
+//  - funct 28 LOOP_WS_CONFIG_NM: rs1 = dram address of the loop's index tile 0 (non-zero, 16 byte aligned), rs2 = 0
+//  - LOOP_WS rs1[3] = 1: a sparse loop. needs sparse mode (config_ex rs1[10]) with A_stride 1, a funct 28 since the
+//    previous LOOP_WS, an empty index fifo (gemmini_nm_reset() first), an even K tile count, pad_K 0, no transposes,
+//    no resadd, no low_D, no spad-only. bias (full-width D) works as in a dense loop
+//  - operands of a sparse loop of I x J x K tiles (K = tiles of the original K): A as dense; B = the compressed
+//    weights, K/2 tiles down; index tiles (NM_META_SPAD_BYTES each) back to back in dram, tile (k', j) at
+//    idx_dram + (k' * J + j) * NM_META_SPAD_BYTES
+//  - the loop keeps its index rows at the top of its scratchpad half, B below them, A at the bottom:
+//    I*K*DIM + (K/2)*J*DIM + (K/2)*J*R rows have to fit the half, and the (K/2)*J*R index rows one bank
+
+#define k_NM_LOAD_IDX 27
+#define k_LOOP_WS_CONFIG_NM 28
+
+#define NM_LOOP_WS_NM_BIT 3
+
+// one index row in dram, and the most rows one LOAD_IDX moves
+#define NM_LOAD_IDX_COLS 16
+#define NM_LOAD_IDX_MAX_ROWS 16
+_Static_assert(DIM * sizeof(elem_t) == NM_LOAD_IDX_COLS, "LOAD_IDX (funct 27) moves 16 byte index rows: needs DIM * sizeof(elem_t) == 16");
+// whole index tiles one LOAD_IDX can move
+#define NM_LOAD_IDX_TILES (NM_LOAD_IDX_MAX_ROWS / NM_SPAD_ROWS_PER_TILE)
+
+// funct 27 with any cols / rows (legal: cols == 16, rows 1..16, spad_addr a plain scratchpad row)
+#define gemmini_nm_extended_load_idx(dram_addr, spad_addr, cols, rows) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, dram_addr, ((uint64_t)(rows) << (ADDR_LEN + 16)) | ((uint64_t)(cols) << ADDR_LEN) | (spad_addr), k_NM_LOAD_IDX)
+#define gemmini_nm_load_idx(dram_addr, spad_addr, rows) \
+  gemmini_nm_extended_load_idx(dram_addr, spad_addr, NM_LOAD_IDX_COLS, rows)
+
+// LOAD_IDX ntiles packed tiles (NM_META_SPAD_BYTES each, back to back in dram) to scratchpad rows spad_row ..
+static inline void nm_load_idx_meta_spad(const uint8_t * packed, uint32_t spad_row, size_t ntiles) {
+  for (size_t t = 0; t < ntiles; t += NM_LOAD_IDX_TILES) {
+    const size_t nt = ntiles - t < NM_LOAD_IDX_TILES ? ntiles - t : NM_LOAD_IDX_TILES;
+    gemmini_nm_load_idx(packed + t * NM_META_SPAD_BYTES, spad_row + (uint32_t)(t * NM_SPAD_ROWS_PER_TILE),
+                        nt * NM_SPAD_ROWS_PER_TILE);
+  }
+}
+
+#define gemmini_loop_ws_config_nm(idx_dram) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, idx_dram, 0, k_LOOP_WS_CONFIG_NM)
+
+// gemmini_loop_ws (gemmini.h) plus the funct 28 and LOOP_WS rs1[3]; B = compressed weights, K = original K tiles
+#define gemmini_loop_ws_nm(I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, a_spad_id, b_spad_id, is_resadd, idx_dram) \
+  { \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, D, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, D_stride, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC) \
+    gemmini_loop_ws_config_nm(idx_dram) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(a_spad_id) << 18) | ((uint64_t)(b_spad_id) << 16) | ((uint64_t)(act) << 8) | ((uint64_t)1 << NM_LOOP_WS_NM_BIT) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((is_resadd) << 2) | ((B_transpose) << 1) | (A_transpose), k_LOOP_WS) \
+  }
+
+// K rounded up to what a sparse loop takes (K % (2*DIM) == 0); pad A with zero columns and W with zero rows
+static inline size_t nm_loop_pad_k(size_t K) { return (K + 2 * DIM - 1) / (2 * DIM) * (2 * DIM); }
+
+// dst (prows x pcols) = src (rows x cols) in the top left corner, zeros elsewhere
+static void nm_zero_pad(size_t rows, size_t cols, const elem_t * src, size_t s_stride,
+    size_t prows, size_t pcols, elem_t * dst, size_t d_stride) {
+  NM_REQUIRE(prows >= rows && pcols >= cols);
+  for (size_t r = 0; r < prows; r++)
+    for (size_t c = 0; c < pcols; c++)
+      dst[r * d_stride + c] = (r < rows && c < cols) ? src[r * s_stride + c] : 0;
+}
+
+// scratchpad rows one sparse loop of I x J x K tiles needs in its half: A, compressed B, index rows
+static inline size_t nm_loop_spad_rows(size_t I, size_t J, size_t K) {
+  return I * K * DIM + (K / 2) * J * (DIM + NM_SPAD_ROWS_PER_TILE);
+}
+// true if the rtl / spike take a sparse loop of this size (double buffered: half the scratchpad and accumulator)
+static inline bool nm_loop_fits(size_t I, size_t J, size_t K) {
+  return I >= 1 && J >= 1 && K >= 2 && K % 2 == 0 &&
+         nm_loop_spad_rows(I, J, K) <= BANK_NUM * BANK_ROWS / 2 &&
+         (K / 2) * J * NM_SPAD_ROWS_PER_TILE <= BANK_ROWS &&
+         I * J * DIM <= ACC_ROWS / 2;
+}
+
+// tile sizes for tiled_matmul_nm_loop: tiled_matmul_auto's (gemmini.h) double-buffered rule with the index rows
+// reserved and tile_K kept even
+static inline void nm_loop_tiles(size_t M, size_t N, size_t K, size_t * TI, size_t * TJ, size_t * TK) {
+  const size_t mt = (M + DIM - 1) / DIM, nt = (N + DIM - 1) / DIM, kt = K / DIM;
+  NM_REQUIRE(M >= 1 && N >= 1 && K >= 2 * DIM && K % (2 * DIM) == 0);
+  size_t ij = 1; // floor(sqrt(tiles in half the accumulator)), as tiled_matmul_auto's db_max_tile_i_j
+  while ((ij + 1) * (ij + 1) <= (ACC_ROWS / 2) / DIM) ij++;
+  size_t ti = mt < ij ? mt : ij, tj = nt < ij ? nt : ij;
+  size_t tk = ((BANK_NUM * BANK_ROWS / 4) / DIM) / ij;
+  if (tk > kt) tk = kt;
+  tk &= ~(size_t)1;
+  if (tk < 2) tk = 2;
+  while (tk > 2 && !nm_loop_fits(ti, tj, tk)) tk -= 2;
+  while (tj > 1 && !nm_loop_fits(ti, tj, tk)) tj--;
+  while (ti > 1 && !nm_loop_fits(ti, tj, tk)) ti--;
+  NM_REQUIRE(nm_loop_fits(ti, tj, tk));
+  for (;;) {
+    bool increased = false;
+    if (tj + 1 <= nt && nm_loop_fits(ti, tj + 1, tk)) { tj++; increased = true; }
+    if (ti + 1 <= mt && nm_loop_fits(ti + 1, tj, tk)) { ti++; increased = true; }
+    if (tk + 2 <= kt && nm_loop_fits(ti, tj, tk + 2)) { tk += 2; increased = true; }
+    if (!increased) break;
+  }
+  *TI = ti; *TJ = tj; *TK = tk;
+}
+
+// index tiles from the (t, jt) order of tiled_matmul_nm_spad (tile (t, jt) at src + (t * src_nt + jt) * NM_META_SPAD_BYTES;
+// src_nt = N / DIM there, or more when N x K is a corner of a bigger layer) into the order tiled_matmul_nm_loop's calls
+// read them: column blocks of tile_J, inside them K blocks of tile_K / 2 compressed tiles, inside them the loop's own
+// (k', j) order. one-time prep, like the compression; dst 16 byte aligned
+static void nm_loop_order_idx(size_t N, size_t K, size_t tile_J, size_t tile_K, const uint8_t * src, size_t src_nt, uint8_t * dst) {
+  const size_t NT = (N + DIM - 1) / DIM, KBT = K / (2 * DIM), tkb = tile_K / 2;
+  NM_REQUIRE(tile_J >= 1 && tkb >= 1 && tile_K % 2 == 0 && K % (2 * DIM) == 0 && src_nt >= NT);
+  const bool words = (uintptr_t)src % 8 == 0 && (uintptr_t)dst % 8 == 0 && NM_META_SPAD_BYTES % 8 == 0;
+  size_t u = 0;
+  for (size_t j0 = 0; j0 < NT; j0 += tile_J)
+    for (size_t k0 = 0; k0 < KBT; k0 += tkb)
+      for (size_t t = k0; t < k0 + tkb && t < KBT; t++)
+        for (size_t jt = j0; jt < j0 + tile_J && jt < NT; jt++, u++) {
+          const uint8_t * s = src + (t * src_nt + jt) * NM_META_SPAD_BYTES;
+          uint8_t * d = dst + u * NM_META_SPAD_BYTES;
+          if (words) for (size_t i = 0; i < NM_META_SPAD_BYTES / 8; i++) ((uint64_t *)d)[i] = ((const uint64_t *)s)[i];
+          else for (size_t i = 0; i < NM_META_SPAD_BYTES; i++) d[i] = s[i];
+        }
+}
+
+// C (M x N acc_t, row stride ldc) = D + A (M x K, row stride lda) * W, through sparse LOOP_WS calls of at most
+// tile_I x tile_J x tile_K tiles (nm_loop_fits; nm_loop_tiles picks them), in tiled_matmul_outer's (gemmini.h) order
+//   Bc       the n:m compressed W, (K/2) x N (row stride ldb), as nm_compress() makes it
+//   D        bias (acc_t, row stride ldd) or NULL; repeating_bias: one row of N values for every row of C
+//   idx_loop the index tiles in nm_loop_order_idx() order for the same tile_J / tile_K, 16 byte aligned
+// requirements: K % (2*DIM) == 0 (nm_loop_pad_k / nm_zero_pad for other K); M and N may end in a partial tile.
+// index rows are mvin'd by the loop itself (funct 27). ends with a dense config_ex and a fence, C is ready on return.
+static void tiled_matmul_nm_loop(size_t M, size_t N, size_t K, const elem_t * A, size_t lda,
+    const elem_t * Bc, size_t ldb, const acc_t * D, size_t ldd, bool repeating_bias,
+    const uint8_t * idx_loop, acc_t * C, size_t ldc, size_t tile_I, size_t tile_J, size_t tile_K) {
+  const size_t MT = (M + DIM - 1) / DIM, NT = (N + DIM - 1) / DIM, KT = K / DIM, KBT = KT / 2, tkb = tile_K / 2;
+  NM_REQUIRE(M >= 1 && N >= 1 && K >= 2 * DIM && K % (2 * DIM) == 0);
+  NM_REQUIRE(nm_loop_fits(tile_I, tile_J, tile_K));
+  NM_REQUIRE(idx_loop != NULL && (uintptr_t)idx_loop % NM_LOAD_IDX_COLS == 0);
+  const size_t I0 = (MT + tile_I - 1) / tile_I, J0 = (NT + tile_J - 1) / tile_J, K0 = (KT + tile_K - 1) / tile_K;
+  const size_t pad_I_last = MT * DIM - M, pad_J_last = NT * DIM - N;
+  const bool no_bias = D == NULL;
+
+  gemmini_nm_reset();
+  gemmini_nm_config_ex(1, NO_ACTIVATION, 0, ACC_SCALE_IDENTITY, 1, 1);
+  gemmini_extended_config_st(ldc * sizeof(acc_t), NO_ACTIVATION, ACC_SCALE_IDENTITY);
+  gemmini_extended3_config_ld(lda * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0);
+  gemmini_extended3_config_ld(ldb * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);
+  gemmini_extended3_config_ld(repeating_bias ? 0 : (ldd * sizeof(acc_t)), MVIN_SCALE_IDENTITY, false, 2);
+
+  for (size_t i0 = 0; i0 < I0; i0++)
+    for (size_t j0 = 0; j0 < J0; j0++)
+      for (size_t k0 = 0; k0 < K0; k0++) {
+        const size_t I = i0 < I0 - 1 ? tile_I : MT - i0 * tile_I;
+        const size_t J = j0 < J0 - 1 ? tile_J : NT - j0 * tile_J;
+        const size_t Kt = k0 < K0 - 1 ? tile_K : KT - k0 * tile_K;
+        const size_t pad_I = i0 == I0 - 1 ? pad_I_last : 0, pad_J = j0 == J0 - 1 ? pad_J_last : 0;
+        const elem_t * a = A + i0 * tile_I * DIM * lda + k0 * tile_K * DIM;
+        const elem_t * b = Bc + k0 * tkb * DIM * ldb + j0 * tile_J * DIM;
+        // bias goes in with the first K block; the later ones accumulate on it
+        const acc_t * d = (k0 == 0 && !no_bias) ? D + (repeating_bias ? 0 : i0 * tile_I * DIM) * ldd + j0 * tile_J * DIM : NULL;
+        const acc_t * c = k0 == K0 - 1 ? C + i0 * tile_I * DIM * ldc + j0 * tile_J * DIM : NULL;
+        const uint8_t * idx = idx_loop + (j0 * tile_J * KBT + J * k0 * tkb) * NM_META_SPAD_BYTES;
+        gemmini_loop_ws_nm(I, J, Kt, pad_I, pad_J, 0, a, b, d, c, lda, ldb, repeating_bias ? 0 : ldd, ldc,
+                           false, false, true, false, k0 != 0 || !no_bias, NO_ACTIVATION, 0, 0, false, idx);
+      }
+
+  gemmini_config_ex(WEIGHT_STATIONARY, NO_ACTIVATION, 0);
+  gemmini_fence();
 }
 
 #endif // GEMMINI_NM_H
