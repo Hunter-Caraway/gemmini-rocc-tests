@@ -298,12 +298,13 @@ int main(void) {
   }
 
   // bank-split-fix layouts (rows from the loop's A start, S = BANK_ROWS = 4096; ea = E rows, bsz = B rows):
+  // the layout depends on tile counts only, so few rows of C keep the CPU reference (and RTL run time) small
   //   kb 128, J 1: ea 2048, bsz 2048, B ends at S, O = [S, S + ea)
-  fails += bank_case("bank: B ends at the bank boundary", DIM, DIM, 256 * DIM, 256);
-  //   kb 96, J 2: ea 1536, bsz 3072, B straddles S, O = [4608, 6144); partial row and column tiles
-  fails += bank_case("bank: B straddles, pad_I and pad_J", DIM - 3, 2 * DIM - 5, 192 * DIM, 192);
+  fails += bank_case("bank: B ends at the bank boundary", 2, DIM, 256 * DIM, 256);
+  //   kb 96, J 2: ea 1536, bsz 3072, B straddles S, O = [4608, 6144); partial column tile
+  fails += bank_case("bank: B straddles, pad_I and pad_J", 3, 2 * DIM - 5, 192 * DIM, 192);
   //   two such loops, the second in the other half, accumulating on the first
-  fails += bank_case("bank: B straddles, 2 loops", DIM / 2, 2 * DIM, 384 * DIM, 192);
+  fails += bank_case("bank: B straddles, 2 loops", 1, 2 * DIM, 384 * DIM, 192);
 
   if (fails) { printf("nm_sparse_loop: %d case(s) FAILED\n", fails); exit(1); }
   printf("nm_sparse_loop passed\n");
