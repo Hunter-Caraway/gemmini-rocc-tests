@@ -13,6 +13,9 @@
 //  - nm_loop_tiles picking the tiles
 //  - sparse loop, then Berkeley's dense loop (tiled_matmul_auto), then two per-tile sparse runs whose index rows the
 //    CPU moves in with LOAD_IDX (all three config_ld strides set to something else), then a sparse loop again
+//  - bank-split-fix (bank-split-fix-spec.md 2.1, 4): loops whose E + B regions (even A K tiles + weights) fill or pass
+//    the first bank of the loop's half: B ends exactly at the bank boundary (O starts on it), B straddles the boundary
+//    (O above B), and two straddling loops back to back (both halves). Smaller cases leave a gap below O.
 //
 // -DNEG=<n>: one illegal use, n / 10 = the assert N<n/10> of spec 2.5.6 that Spike must abort on and the RTL must
 // assert on with that message (exit 0 = NOT caught):
@@ -24,6 +27,7 @@
 //   70 N7 A_transpose   71 N7 B_transpose   72 N7 is_resadd   73 N7 low_D   74 N7 spad-only (rs2[9])
 //   80 N8 A_stride == 2
 //   90 N9 A + B + index rows over the scratchpad half     91 N9 more than one bank of index rows
+//   92 N9 (bank-split-fix BS1) even A K tiles alone over one bank (A over the half)
 //   100 N10 a register index tile pending when the loop starts
 //   110 N11 funct 27 on a dense build. dense Spike lib (libgemmini NM_DENSE_BUILD=1) only: legal on an n:m build,
 //       and the dense RTL has no funct 27 / 28 hardware and no assert (spec changelog 2026-11-13, D1)
@@ -178,6 +182,51 @@ static int per_tile_case(const char * name, size_t M, size_t N, size_t K, uint32
   return check(name, M, N);
 }
 
+#ifndef NEG
+// ---- bank-split-fix layout cases: own buffers, K up to BK columns, one row tile, up to two column tiles ----
+#define BM DIM
+#define BN (2 * DIM)
+#define BK (384 * DIM)
+#define BT ((BK / (2 * DIM)) * (BN / DIM))
+static elem_t ba[BM][BK] row_align(1);
+static elem_t bw[BK][BN] row_align(1);
+static elem_t bwc[BK / 2][BN] row_align(1);
+static nm_idx_t bidx[BK / 2][BN];
+static uint8_t bmeta_tj[BT][TB] row_align(1);
+static uint8_t bmeta_loop[BT][TB] row_align(1);
+static acc_t bgold[BM][BN];
+static acc_t bc_out[BM][BN] row_align_acc(1);
+
+// sparse loops of 1 x NT x tile_K tiles over an M x N x K problem (K % (2*DIM) == 0, no bias)
+static int bank_case(const char * name, size_t M, size_t N, size_t K, size_t tile_K) {
+  NM_REQUIRE(M <= BM && N <= BN && K <= BK && K % (2 * DIM) == 0 && tile_K % 2 == 0);
+  const size_t NT = (N + DIM - 1) / DIM, KBT = K / (2 * DIM);
+  for (size_t y = 0; y < M; y++) for (size_t z = 0; z < K; z++) ba[y][z] = rnd(-128, 127);
+  for (size_t z = 0; z < K; z++) for (size_t x = 0; x < N; x++) bw[z][x] = rnd(-128, 127);
+  nm_prune(K, N, &bw[0][0], BN, NM_N, NM_M);
+  NM_REQUIRE(nm_check(K, N, &bw[0][0], BN, NM_N, NM_M));
+  nm_ref_dense(M, K, N, &ba[0][0], BK, &bw[0][0], BN, &bgold[0][0], BN);
+  nm_compress(K, N, &bw[0][0], BN, &bwc[0][0], &bidx[0][0], BN, NM_N, NM_M);
+  for (size_t t = 0; t < KBT; t++)
+    for (size_t jt = 0; jt < NT; jt++)
+      nm_pack_meta_spad(&bidx[t * DIM][jt * DIM], BN, DIM, N - jt * DIM < DIM ? N - jt * DIM : DIM, NM_M, bmeta_tj[t * NT + jt]);
+  nm_loop_order_idx(N, K, NT, tile_K, bmeta_tj[0], NT, bmeta_loop[0]);
+  poison();
+  for (int y = 0; y < BM; y++) for (int x = 0; x < BN; x++) bc_out[y][x] = POISON;
+  tiled_matmul_nm_loop(M, N, K, &ba[0][0], BK, &bwc[0][0], BN, NULL, BN, false, bmeta_loop[0], &bc_out[0][0], BN, 1, NT, tile_K);
+  int bad = 0;
+  for (size_t y = 0; y < BM; y++) for (size_t x = 0; x < BN; x++) {
+    const bool in = y < M && x < N;
+    if (in ? bc_out[y][x] != bgold[y][x] : bc_out[y][x] != POISON) {
+      if (!bad) printf("%s: %s at (%d,%d): got %d\n", name, in ? "mismatch" : "wrote outside C", (int)y, (int)x, bc_out[y][x]);
+      bad++;
+    }
+  }
+  printf("%-34s %s (%d/%d wrong)\n", name, bad ? "FAIL" : "ok", bad, (int)(M * N));
+  return bad != 0;
+}
+#endif
+
 #ifdef NEG
 // the loop config commands one by one, so a NEG case can leave out or bend any of them. the operands are the valid
 // 1 x 1 x 2 tile case made in main(); ws_rs1 0xA = rs1[3] (sparse loop) + full_C
@@ -248,6 +297,14 @@ int main(void) {
     fails += loop_again("seq: sparse loop, 2 calls", M, N, K, 2, 2, 2);
   }
 
+  // bank-split-fix layouts (rows from the loop's A start, S = BANK_ROWS = 4096; ea = E rows, bsz = B rows):
+  //   kb 128, J 1: ea 2048, bsz 2048, B ends at S, O = [S, S + ea)
+  fails += bank_case("bank: B ends at the bank boundary", DIM, DIM, 256 * DIM, 256);
+  //   kb 96, J 2: ea 1536, bsz 3072, B straddles S, O = [4608, 6144); partial row and column tiles
+  fails += bank_case("bank: B straddles, pad_I and pad_J", DIM - 3, 2 * DIM - 5, 192 * DIM, 192);
+  //   two such loops, the second in the other half, accumulating on the first
+  fails += bank_case("bank: B straddles, 2 loops", DIM / 2, 2 * DIM, 384 * DIM, 192);
+
   if (fails) { printf("nm_sparse_loop: %d case(s) FAILED\n", fails); exit(1); }
   printf("nm_sparse_loop passed\n");
   exit(0);
@@ -293,6 +350,9 @@ int main(void) {
 #elif NEG == 91
   // 32 * 40 index tiles: over one bank of index rows for 2:4 and 4:8 (B alone is over the half too)
   sparse_on(1); raw_loop(1, 40, 64, 0, 1, IDX0, 0, WS_NM, 0);
+#elif NEG == 92
+  // E = 17 * 16 * DIM = 4352 rows, over one bank: A = 8704 rows is over the half, so N9 fires (bank-split-fix-spec.md 3.2 BS1)
+  sparse_on(1); raw_loop(17, 1, 32, 0, 1, IDX0, 0, WS_NM, 0);
 #elif NEG == 100
   sparse_on(1);
   { uint64_t reg[2 * DIM]; nm_pack_meta(&idx[0][0], MAXN, DIM, DIM, NM_M, reg); nm_send_meta(reg, NM_M); }

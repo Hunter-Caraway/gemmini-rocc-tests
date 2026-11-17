@@ -626,7 +626,9 @@ static void nm_zero_pad(size_t rows, size_t cols, const elem_t * src, size_t s_s
 static inline size_t nm_loop_spad_rows(size_t I, size_t J, size_t K) {
   return I * K * DIM + (K / 2) * J * (DIM + NM_SPAD_ROWS_PER_TILE);
 }
-// true if the rtl / spike take a sparse loop of this size (double buffered: half the scratchpad and accumulator)
+// true if the rtl / spike take a sparse loop of this size (double buffered: half the scratchpad and accumulator).
+// bank-split-fix: the loop keeps even A K tiles in one bank and odd ones in the other (bank-split-fix-spec.md 2.1, B
+// "straddle"); this bound already implies that layout fits (even tiles <= one bank, idx rows < B rows), so no extra rule
 static inline bool nm_loop_fits(size_t I, size_t J, size_t K) {
   return I >= 1 && J >= 1 && K >= 2 && K % 2 == 0 &&
          nm_loop_spad_rows(I, J, K) <= BANK_NUM * BANK_ROWS / 2 &&
